@@ -99,6 +99,7 @@ Redemption requests **SHOULD** use `POST` (proof in body). `GET`-with-body is no
   "zk-credential": {
     "credential": {
       "suite": "<suite-id>",
+      "kid": "key-YYYY-MM",
       "service_id": "<base64url-service-id>",
       "tier": 1,
       "identity_limit": 1000,
@@ -110,7 +111,7 @@ Redemption requests **SHOULD** use `POST` (proof in body). `GET`-with-body is no
 }
 ```
 
-All fields above are **REQUIRED**.
+All fields above are **REQUIRED** except `kid`, which is **OPTIONAL** (supports key rotation; see Key rotation section).
 
 ### 4) Redemption request envelope (Phase 2 request body)
 
