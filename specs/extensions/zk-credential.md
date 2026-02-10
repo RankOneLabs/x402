@@ -139,6 +139,7 @@ Server derives an `origin_id` from the request URL to prevent cross-endpoint rep
 
 ```
 canonical_origin = scheme + "://" + lowercase(host) + normalized_path
+stringToField(s) = SHA-256(s) mod p   (where p is the BN254 scalar field order)
 origin_id = Poseidon(stringToField(canonical_origin))
 ```
 
