@@ -5,161 +5,250 @@
 
 ## Summary
 
-`zk-credential` enables **pay-once, redeem-many** access without introducing a stable session identifier (API keys/bearer tokens). After x402 settlement, the facilitator issues a signed credential; later requests present a **zero-knowledge proof** that the client holds a valid, unexpired credential for the requested origin and tier.
+`zk-credential` enables **pay-once, redeem-many** access without introducing a stable session identifier (API keys/bearer tokens). After x402 settlement, the issuer issues a signed credential; later requests present a **zero-knowledge proof** that the client holds a valid, unexpired credential for the requested origin and tier.
+
+**Non-goals:** Key discovery endpoints and on-the-wire keyset protocols are out of scope; this spec defines only presentation-time key carriage and verifier authorization requirements.
 
 ## Roles
 
 - **Client**: pays once, stores credential, generates proofs for later requests.
-- **Server**: advertises extension; forwards issuance input during settlement; verifies proofs locally.
-- **Facilitator (Issuer)**: settles payment and issues the credential.
+- **Server**: advertises extension; forwards issuance input during settlement.
+- **Issuer**: signs credentials. MAY be the Facilitator (default) or the Server itself; similar to how Server MAY equal Facilitator in x402.
+- **Verifier**: the policy-enforcing component that validates proofs and authorizes access. Typically the Server, or an authorized gateway acting on its behalf. Verifiers accept only `service_id` + issuer key combinations they are independently configured to trust; extension advertisements are informational, not authoritative. The mechanism by which a verifier is authorized to enforce a service's policy (e.g., deployment topology, mTLS, static configuration) is out of scope.
 
 ## Transport and Encoding
 
-### Transport
-- **Proofs MUST be supported in the HTTP request body.** Body transport is the REQUIRED conformance mode.
-- **Servers MUST NOT require proofs in headers.**
-- **Servers MAY accept a header-carried proof as an optimization, but MUST SUPPORT body transport for conformance.** 
-- **Any header-carried proof is an optional, non-normative optimization.**
-- **If any header is used, it MUST be metadata-only (e.g., `suite`, `kid`) and MUST NOT be required.**
-- Credentials **MUST** be returned in the HTTP **response body**.
+### Issuance (Phase 1) — standard x402 extension plumbing
+- Commitment travels inside `PaymentPayload.extensions["zk-credential"].info.commitment` via the standard `PAYMENT-SIGNATURE` header.
+- Credential is returned inside `SettleResponse.extensions["zk-credential"].credential` via the standard `PAYMENT-RESPONSE` header.
+
+### Presentation (Phase 2) — body envelope
+- Proof and application payload are wrapped in an `x402_zk_credential` body envelope.
+- Presence of `x402_zk_credential` in the request body is the canonical signal for ZK credential redemption.
+- **Proofs MUST be in the request body** (UltraHonk proofs ~15KB exceed header limits).
+- Redemption requests **MUST** use an HTTP method that permits a request body. `POST` is **RECOMMENDED**.
+- **Zero custom headers** for the entire extension lifecycle.
 
 ### Content types
 - `Content-Type: application/json` **REQUIRED**
 - `Content-Type: application/cbor` **OPTIONAL**
 
-### Encoding rules
-Encoding is determined by `Content-Type`:
-- If `application/json`, all binary fields **MUST** be **base64url without padding** (RFC 4648 URL-safe alphabet, `-` and `_`, no trailing `=`).
-- If `application/cbor`, binary fields are raw byte strings.
+### Canonical encoding for cryptographic objects
 
-Timestamps:
-- `expires_at` and `current_time` **MUST** be Unix time in seconds (integer).
+Suite-specific cryptographic objects (commitments, signatures) **MUST** use the suite-typed string format:
 
-Binary fields (JSON / base64url-no-pad):
-- `proof`, `signature`, `pubkey`, `commitment`, `origin_token`, `service_id` (and any other byte arrays).
+```
+"<suite-id>:<base64url(bytes)>"
+```
+
+All public keys are encoded as raw bytes base64url (no padding) in a `*_pubkey` field and are interpreted under the suite indicated by the nearest `suite` / `*_suite` field. The encoding rules are:
+
+- The pubkey field is base64url of raw public-key bytes, no padding.
+- Key serialization (compressed/uncompressed, curve point encoding) is defined by the suite.
+- Verifiers **MUST** reject keys that are not valid encodings for the suite.
+
+For the `pedersen-schnorr-poseidon-ultrahonk` suite, points use uncompressed encoding: `0x04 || x || y` (64 bytes for BN254).
+
+Examples:
+- Adjacent-field public key: `"issuer_suite": "pedersen-schnorr-poseidon-ultrahonk", "issuer_pubkey": "BAAB..."`
+- Suite-typed commitment: `"pedersen-schnorr-poseidon-ultrahonk:BAAB..."`
+- Suite-typed signature: `"pedersen-schnorr-poseidon-ultrahonk:AQID..."`
+
+Hex (`0x...`) is reserved for on-chain artifacts only (addresses, transaction hashes).
+
+Other binary fields (`proof`, `origin_token`) use plain base64url without suite prefix.
 
 ## Phase 1 — Payment + credential issuance
 
-1. Server responds `402` and advertises `extensions.zk-credential`.
-2. Client retries payment and includes `extensions.zk-credential.commitment`.
-3. Server forwards `commitment` to the facilitator during settlement.
-4. Facilitator returns settlement result plus a signed `credential`.
-5. Server returns `credential` to the client in the response body.
+1. Server responds `402` and advertises `extensions["zk-credential"]` with `{ info, schema }` structure.
+2. Client retries payment with `PAYMENT-SIGNATURE`; includes commitment inside `PaymentPayload.extensions["zk-credential"].info.commitment`.
+3. Server forwards `commitment` to the issuer during settlement.
+4. Issuer returns settlement result plus a signed `credential`.
+5. Server's `enrichSettlementResponse` hook injects credential into `SettleResponse.extensions["zk-credential"]`; client reads it from the standard `PAYMENT-RESPONSE` header.
 
 ## Phase 2 — Redemption
 
-Client sends a `zk-credential` proof envelope in the request body. Server verifies locally and serves the resource if valid.
+Client sends a request with an `x402_zk_credential` proof envelope in the request body. Server verifies locally, unwraps `payload` for the application handler, and serves the resource if valid.
 
-Redemption requests **SHOULD** use `POST` (proof in body). `GET`-with-body is not required and may be unsupported by intermediaries.
+Redemption requests **MUST** use an HTTP method that permits a request body. `POST` is **RECOMMENDED**.
 
 ## Wire format
 
-### 1) Extension advertisement (in 402 response body)
+### 1) Extension advertisement (in `PaymentRequired.extensions["zk-credential"]`)
+
+Follows the x402 SDK `{ info, schema }` pattern:
 
 ```json
 {
   "extensions": {
     "zk-credential": {
-      "version": "0.1.0",
-      "credential_suites": ["<suite-id>"],
-      "facilitator_pubkey": "<suite-id>:<pubkey-bytes>",
-      "max_credential_ttl": 86400,
-      "content_types": ["application/json", "application/cbor"]
+      "info": {
+        "version": "0.1.0",
+        "credential_suites": ["pedersen-schnorr-poseidon-ultrahonk"],
+        "issuer_suite": "pedersen-schnorr-poseidon-ultrahonk",
+        "issuer_pubkey": "BAAB...",
+        "max_credential_ttl": 86400,
+        "service_id": "k7VzM_xR9bQ2h1nPfEjw"
+      },
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "commitment": {
+            "type": "string",
+            "description": "Suite-typed commitment: '<suite>:<base64url(point)>'"
+          }
+        }
+      }
     }
   }
 }
 ```
 
-- `version` (REQUIRED)
-- `credential_suites` (REQUIRED)
-- `facilitator_pubkey` (REQUIRED)
-- `max_credential_ttl` (OPTIONAL)
-- `content_types` (OPTIONAL): advertised supported content types
+- `info.version` (REQUIRED)
+- `info.credential_suites` (REQUIRED)
+- `info.issuer_suite` (REQUIRED) — suite identifier string
+- `info.issuer_pubkey` (REQUIRED) — base64url of raw public-key bytes (no suite prefix, no padding). This is a currently valid key; it is **informational** for clients. Verifiers authorize keys from their local key set, not from the advertisement (see §Verification Keys).
+- `info.max_credential_ttl` (OPTIONAL)
+- `info.service_id` (REQUIRED) — identifies the logical policy domain for which verifiers enforce rules, not a specific physical server or deployment. Encoded as base64url of 16 random bytes (128 bits), no padding. Issuers **MUST** generate `service_id` using a cryptographically secure RNG. `service_id` is stable for a service across key rotations unless the service intentionally changes identity. MUST match credential `service_id`.
+- `schema` declares what the client appends inside `info` (the commitment)
 
 ### 2) Payment request with commitment (Phase 1)
 
+Commitment is placed inside `PaymentPayload.extensions["zk-credential"].info.commitment`. Only the standard `PAYMENT-SIGNATURE` header is used:
+
+```
+PAYMENT-SIGNATURE: <base64 PaymentPayload>
+```
+
+The client echoes the server's extension and appends `commitment` inside `info`:
+
 ```json
 {
-  "x402Version": 2,
-  "payment": { "...": "..." },
-  "extensions": {
-    "zk-credential": {
-      "commitment": "<suite-id>:<base64url-commitment>"
-    }
+  "info": {
+    "version": "0.1.0",
+    "credential_suites": ["pedersen-schnorr-poseidon-ultrahonk"],
+    "issuer_suite": "pedersen-schnorr-poseidon-ultrahonk",
+    "issuer_pubkey": "BAAB...",
+    "commitment": "pedersen-schnorr-poseidon-ultrahonk:<base64url-commitment-point>"
+  },
+  "schema": { "..." }
+}
+```
+
+- `commitment` (REQUIRED) — suite-typed string encoding the Pedersen commitment point
+
+### 3) Credential issuance (inside `SettleResponse.extensions["zk-credential"]` via `PAYMENT-RESPONSE` header)
+
+The credential is returned inside the standard `PAYMENT-RESPONSE` header. No custom response headers are used.
+
+```
+PAYMENT-RESPONSE: <base64 SettleResponse>
+```
+
+Decoded `SettleResponse.extensions["zk-credential"]`:
+
+```json
+{
+  "credential": {
+    "suite": "pedersen-schnorr-poseidon-ultrahonk",
+    "service_id": "k7VzM_xR9bQ2h1nPfEjw",
+    "tier": 1,
+    "identity_limit": 1000,
+    "expires_at": 1707004800,
+    "commitment": "pedersen-schnorr-poseidon-ultrahonk:<base64url-commitment>",
+    "signature": "pedersen-schnorr-poseidon-ultrahonk:<base64url-signature>"
   }
 }
 ```
 
-- `commitment` (REQUIRED)
-
-### 3) Credential issuance (Phase 1 response body)
-
-```json
-{
-  "zk-credential": {
-    "credential": {
-      "suite": "<suite-id>",
-      "kid": "key-YYYY-MM",
-      "service_id": "<base64url-service-id>",
-      "tier": 1,
-      "identity_limit": 1000,
-      "expires_at": 1707004800,
-      "commitment": "<base64url-commitment>",
-      "signature": "<base64url-signature>"
-    }
-  }
-}
-```
-
-All fields above are **REQUIRED** except `kid`, which is **OPTIONAL** (supports key rotation; see Key rotation section).
+All fields above are **REQUIRED**.
 
 ### 4) Redemption request envelope (Phase 2 request body)
 
+Client wraps the proof in an `x402_zk_credential` body envelope:
+
+```
+POST /api/resource HTTP/1.1
+Content-Type: application/json
+```
+
 ```json
 {
-  "zk-credential": {
+  "x402_zk_credential": {
     "version": "0.1.0",
-    "suite": "<suite-id>",
-    "kid": "key-YYYY-MM",
+    "suite": "pedersen-schnorr-poseidon-ultrahonk",
+    "issuer_pubkey": "BAAB...",
     "proof": "<base64url-proof>",
     "current_time": 1707004800,
     "public_outputs": {
       "origin_token": "<base64url-origin-token>",
       "tier": 1
     }
-  }
+  },
+  "payload": null
 }
 ```
 
-- `version`, `suite`, `proof`, `current_time`, `public_outputs` are **REQUIRED**
-- `kid` is **RECOMMENDED**
+- `x402_zk_credential`: `version`, `suite`, `issuer_pubkey`, `proof`, `current_time`, `public_outputs` are **REQUIRED**
+- `issuer_pubkey`: base64url of raw public-key bytes (must match `suite`; verifier checks against authorized key set)
+- `payload`: application request body (or `null` for requests with no body); server middleware unwraps this for the application handler
 
-## Origin binding 
+## Origin binding
 
 Server derives an `origin_id` from the request URL to prevent cross-endpoint replay:
 
 ```
-canonical_origin = scheme + "://" + lowercase(host) + normalized_path
-stringToField(s) = SHA-256(s) mod p   (where p is the BN254 scalar field order)
-origin_id = Poseidon(stringToField(canonical_origin))
+canonical_origin = canonicalize(request_url)
+stringToField(s) = SHA-256(UTF-8(s)) mod p   (where p is the BN254 scalar field order)
+origin_id = stringToField(canonical_origin)
 ```
 
-Normalization:
-- scheme lowercase
-- host lowercase; include port only if non-default
-- strip trailing `/` from path
-- exclude query string
+### Canonicalization algorithm
+
+Given a request URL, produce `canonical_origin` via the following deterministic steps:
+
+1. **Parse** the URL into RFC 3986 components: `scheme`, `host`, `port`, `path`. **Reject** if parsing fails.
+2. **Scheme**: lowercase (e.g. `HTTPS` → `https`).
+3. **Host**: lowercase. Implementations **MUST** convert Unicode hostnames to Punycode (IDNA) before lowercasing.
+4. **Port**: omit default ports (`80` for `http`, `443` for `https`); include non-default ports.
+5. **Path**: if empty, set to `/`.
+6. **Dot-segment removal**: normalize `.` and `..` segments per RFC 3986 §5.2.4.
+7. **Query and fragment**: **MUST** be excluded.
+8. **Percent-encoding**: use the path as produced by the URL parser after dot-segment removal; do **not** decode/re-encode percent escapes.
+9. **Assemble**: `canonical_origin = scheme + "://" + host + port_suffix + normalized_path` where `port_suffix` is `":" + port` only when non-default.
+
+### Test vectors
+
+| Input URL | `canonical_origin` |
+|---|---|
+| `https://API.Example.COM/v1/data` | `https://api.example.com/v1/data` |
+| `https://api.example.com:443/v1/data` | `https://api.example.com/v1/data` |
+| `http://api.example.com:8080/v1/data` | `http://api.example.com:8080/v1/data` |
+| `https://api.example.com` | `https://api.example.com/` |
+| `https://api.example.com/a/b/../c` | `https://api.example.com/a/c` |
+| `https://api.example.com/a/./b` | `https://api.example.com/a/b` |
+| `https://api.example.com/v1/data?key=val#frag` | `https://api.example.com/v1/data` |
+| `https://api.example.com/hello%20world` | `https://api.example.com/hello%20world` |
 
 ## Proof statement
 
 A valid proof MUST prove (suite-defined construction) that:
-- the client holds a facilitator-signed credential for `service_id`
+- the client holds an issuer-signed credential for `service_id`
+- the credential was signed by the `issuer_pubkey` provided in the presentation
 - `current_time <= expires_at`
 - credential `tier` satisfies server policy
 - `origin_id` is correctly bound (prevents replay across origins)
 - the proof outputs include `(origin_token, tier)`
 
+Verifiers **MUST** verify the proof using the provided `issuer_pubkey` and **MUST** ensure that the key is authorized for the associated service (e.g., by matching against a locally configured allowlist or trusted key set).
+
 Suites define the proving system and verifier parameters; SNARK and STARK suites are both compatible with this extension.
+
+## Version and suite negotiation
+
+- For `0.x` versions, client and server MUST match `version` exactly.
+- Client MUST present a `suite` listed in the server's `credential_suites`.
 
 ## Clock skew check
 
@@ -171,7 +260,9 @@ abs(current_time - server_clock) > 60 seconds
 
 ## Replay prevention / rate limiting
 
-Servers use `origin_token` to enforce replay prevention and/or rate limiting; caches MUST be TTL-bounded by credential expiry.
+`origin_token` is a pseudonymous, origin-bound identifier derived within the proof from private credential material and the origin binding. The same credential MAY produce multiple unlinkable `origin_token` values for the same origin, bounded by the credential's `identity_limit`. Reusing the same derivation inputs across requests produces a stable token (enabling rate limiting) at the cost of cross-request linkability within that origin.
+
+Verifiers MAY use `origin_token` for bounded replay detection and/or rate limiting within the credential validity window. Caches MUST be TTL-bounded by credential expiry.
 
 ## Errors
 
@@ -179,38 +270,16 @@ Servers use `origin_token` to enforce replay prevention and/or rate limiting; ca
 |------|------|---------|
 | `credential_missing` | 402 | no payment or credential provided |
 | `tier_insufficient` | 402 | proof tier below requirement |
+| `unsupported_version` | 400 | version not supported |
 | `unsupported_suite` | 400 | suite not supported |
-| `invalid_proof` | 400 | proof verification failed |
+| `invalid_proof` | 400 | proof verification failed (includes origin mismatch) |
 | `payload_too_large` | 413 | proof body exceeds server limit |
 | `unsupported_media_type` | 415 | content-type not supported |
 | `rate_limited` | 429 | origin token rate limited |
 
-## Key rotation
+## Verification Keys: Distribution & Rollover
 
-Servers MUST support issuer key selection by `kid` (or a configured default if omitted).
+- Presentations **MUST** include `issuer_pubkey`.
+- Verifiers **MUST** only accept presentations whose `issuer_pubkey` is authorized by verifier policy (e.g., local configuration, trusted key list) for the `service_id`.
+- Issuers **MAY** rotate keys at any time; verifiers **SHOULD** overlap old and new keys long enough to avoid breaking valid credentials before expiry.
 
-Servers SHOULD expose issuer public keys via HTTP at:
-
-`GET /.well-known/zk-credential-keys`
-
-```json
-{
-  "keys": [
-    { "kid": "key-YYYY-MM", "suite": "<suite-id>", "pubkey": "<base64url-pubkey>", "valid_from": 1706918400, "valid_until": null }
-  ]
-}
-```
-
-Clients MUST NOT depend on discovery; keys may also be provisioned out-of-band.
-
-## Conformance
-
-An implementation conforms if it:
-1) advertises `extensions.zk-credential`  
-2) accepts proofs in request bodies  
-3) returns credentials in response bodies  
-4) forwards `commitment` to facilitator during settlement  
-5) verifies proofs locally during redemption  
-6) computes `origin_id` per the normalization rules above  
-7) enforces clock skew check  
-8) implements the error codes above  
