@@ -235,15 +235,37 @@ Given a request URL, produce `canonical_origin` via the following deterministic 
 
 ## Proof statement
 
+### Public inputs (verifier-supplied)
+
+The verifier supplies the following values as public inputs to the proof. These are not carried in the proof envelope; the verifier derives or resolves them locally:
+
+| Input | Source |
+|---|---|
+| `service_id` | Verifier's local configuration for the service being accessed |
+| `current_time` | From the presentation envelope (after clock-skew check) |
+| `origin_id` | Derived from the request URL (see §Origin binding) |
+| `issuer_pubkey` | From the presentation envelope (verified against authorized key set) |
+
+### Public outputs (proof-returned)
+
+The proof returns the following values for the verifier to inspect:
+
+| Output | Purpose |
+|---|---|
+| `origin_token` | Pseudonymous, origin-bound identifier for rate limiting |
+| `tier` | Access tier for authorization decisions |
+
+### Proof constraints
+
 A valid proof MUST prove (suite-defined construction) that:
-- the client holds an issuer-signed credential for `service_id`
+- the credential contains `service_id` as an issuer-integrity-protected field, and `credential.service_id` equals the verifier-supplied public input `service_id`
 - the credential was signed by the `issuer_pubkey` provided in the presentation
 - `current_time <= expires_at`
 - credential `tier` ≥ the server's required tier for the requested resource
 - the client's chosen derivation index `i` satisfies `0 <= i < identity_limit`
 - `origin_token` is deterministically derived from private credential material, `origin_id`, and derivation index `i`
 - `origin_id` is correctly bound (prevents replay across origins)
-- the proof outputs include `(origin_token, tier)`
+- the proof returns `(origin_token, tier)` as public outputs
 
 Verifiers **MUST** verify the proof using the provided `issuer_pubkey` and **MUST** ensure that the key is authorized for the associated service (e.g., by matching against a locally configured allowlist or trusted key set).
 
