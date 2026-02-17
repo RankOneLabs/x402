@@ -26,12 +26,12 @@
 - Proof and application payload are wrapped in an `x402_zk_credential` body envelope.
 - Presence of `x402_zk_credential` in the request body is the canonical signal for ZK credential redemption.
 - **Proofs MUST be in the request body** (UltraHonk proofs ~15KB exceed header limits).
-- Redemption requests **MUST** use an HTTP method that permits a request body. `POST` is **RECOMMENDED**.
-- **Zero custom headers** for the entire extension lifecycle.
+- Redemption requests **MUST** use an HTTP method that permits a request body. `POST` is **RECOMMENDED**; `GET` is **NOT RECOMMENDED**.
+- **No extension-specific headers**; uses only standard x402 headers (`PAYMENT-SIGNATURE`, `PAYMENT-RESPONSE`) for issuance.
 
 ### Content types
 - `Content-Type: application/json` **REQUIRED**
-- `Content-Type: application/cbor` **OPTIONAL**
+- `Content-Type: application/cbor` **OPTIONAL** — CBOR encodes the same logical fields; byte-valued fields remain base64url strings.
 
 ### Canonical encoding for cryptographic objects
 
@@ -57,6 +57,8 @@ Examples:
 Hex (`0x...`) is reserved for on-chain artifacts only (addresses, transaction hashes).
 
 Other binary fields (`proof`, `origin_token`) use plain base64url without suite prefix.
+
+All base64url values in this specification use unpadded encoding per RFC 4648 §5.
 
 ## Phase 1 — Payment + credential issuance
 
@@ -108,9 +110,9 @@ Follows the x402 SDK `{ info, schema }` pattern:
 - `info.version` (REQUIRED)
 - `info.credential_suites` (REQUIRED)
 - `info.issuer_suite` (REQUIRED) — suite identifier string
-- `info.issuer_pubkey` (REQUIRED) — base64url of raw public-key bytes (no suite prefix, no padding). This is a currently valid key; it is **informational** for clients. Verifiers authorize keys from their local key set, not from the advertisement (see §Verification Keys).
+- `info.issuer_pubkey` (REQUIRED) — base64url of raw public-key bytes (no suite prefix, no padding). This is a currently valid key; it is **informational** for clients. Required so clients can pre-select a compatible suite and cache key material before proof generation; verifiers still gate acceptance by local policy (see §Verification Keys).
 - `info.max_credential_ttl` (OPTIONAL)
-- `info.service_id` (REQUIRED) — identifies the logical policy domain for which verifiers enforce rules, not a specific physical server or deployment. Encoded as base64url of 16 random bytes (128 bits), no padding. Issuers **MUST** generate `service_id` using a cryptographically secure RNG. `service_id` is stable for a service across key rotations unless the service intentionally changes identity. MUST match credential `service_id`.
+- `info.service_id` (REQUIRED) — identifies the logical policy domain for which verifiers enforce rules, not a specific physical server or deployment. Encoded as base64url of 16 random bytes (128 bits), no padding. Issuers **MUST** generate `service_id` using a cryptographically secure RNG. `service_id` is stable for a service across key rotations unless the service intentionally changes identity. MUST match credential `service_id`. How a verifier maps an incoming request to a `service_id` (e.g., by virtual host, route table, or API gateway configuration) is out of scope.
 - `schema` declares what the client appends inside `info` (the commitment)
 
 ### 2) Payment request with commitment (Phase 1)
@@ -233,18 +235,20 @@ Given a request URL, produce `canonical_origin` via the following deterministic 
 | `https://api.example.com/v1/data?key=val#frag` | `https://api.example.com/v1/data` |
 | `https://api.example.com/hello%20world` | `https://api.example.com/hello%20world` |
 
+Canonicalization uses the externally visible request URL as seen by the verifier or gateway, not internal upstream paths. Deployments **MUST** ensure a consistent canonical URL at the point of verification.
+
 ## Proof statement
 
-### Public inputs (verifier-supplied)
+### Verification inputs
 
-The verifier supplies the following values as public inputs to the proof. These are not carried in the proof envelope; the verifier derives or resolves them locally:
+The following values are supplied as public inputs to the proof. The verifier derives or resolves each from the indicated source:
 
 | Input | Source |
 |---|---|
-| `service_id` | Verifier's local configuration for the service being accessed |
+| `service_id` | Verifier's local configuration for the service being accessed; **MUST** correspond to the `service_id` the issuer signed into the credential |
 | `current_time` | From the presentation envelope (after clock-skew check) |
 | `origin_id` | Derived from the request URL (see §Origin binding) |
-| `issuer_pubkey` | From the presentation envelope (verified against authorized key set) |
+| `issuer_pubkey` | From the presentation envelope; verifier **MUST** validate it is authorized for the `service_id` under local policy |
 
 ### Public outputs (proof-returned)
 
@@ -261,13 +265,14 @@ A valid proof MUST prove (suite-defined construction) that:
 - the credential contains `service_id` as an issuer-integrity-protected field, and `credential.service_id` equals the verifier-supplied public input `service_id`
 - the credential was signed by the `issuer_pubkey` provided in the presentation
 - `current_time <= expires_at`
-- credential `tier` ≥ the server's required tier for the requested resource
 - the client's chosen derivation index `i` satisfies `0 <= i < identity_limit`
 - `origin_token` is deterministically derived from private credential material, `origin_id`, and derivation index `i`
 - `origin_id` is correctly bound (prevents replay across origins)
-- the proof returns `(origin_token, tier)` as public outputs
+- the proof returns `(origin_token, tier)` as public outputs, where `tier` corresponds to the issuer-integrity-protected credential tier
 
 Verifiers **MUST** verify the proof using the provided `issuer_pubkey` and **MUST** ensure that the key is authorized for the associated service (e.g., by matching against a locally configured allowlist or trusted key set).
+
+Verifiers **MUST** determine `required_tier` for the requested resource under local policy and **MUST** reject if `tier < required_tier`.
 
 Suites define the proving system and verifier parameters; SNARK and STARK suites are both compatible with this extension.
 
@@ -284,6 +289,8 @@ Server MUST reject before verification if:
 abs(current_time - server_clock) > 60 seconds
 ```
 
+The verifier uses the client-provided `current_time` (after passing the skew check) as the proof's time input; the verifier does not substitute its own clock value into the proof. This ensures deterministic verification against exactly what was proven.
+
 ## Replay prevention / rate limiting
 
 `origin_token` is a pseudonymous, origin-bound identifier derived within the proof from private credential material, the origin binding, and a derivation index. Using the same derivation index across requests produces a stable `origin_token` (enabling rate limiting) at the cost of cross-request linkability within that origin; different indices produce unlinkable tokens, up to the credential's `identity_limit`.
@@ -294,7 +301,7 @@ Verifiers MAY use `origin_token` for bounded replay detection and/or rate limiti
 
 | Code | HTTP | Meaning |
 |------|------|---------|
-| `credential_missing` | 402 | no payment or credential provided |
+| `credential_missing` | 402 | request contains neither a standard x402 payment nor a zk-credential envelope |
 | `tier_insufficient` | 402 | credential tier does not meet the server's required tier; may indicate a server–issuer tier configuration mismatch |
 | `unsupported_version` | 400 | version not supported |
 | `unsupported_suite` | 400 | suite not supported |
