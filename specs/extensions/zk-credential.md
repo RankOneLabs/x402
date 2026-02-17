@@ -164,6 +164,8 @@ Decoded `SettleResponse.extensions["zk-credential"]`:
 
 All fields above are **REQUIRED**.
 
+- `identity_limit` — maximum number of distinct pseudonymous identities the credential holder may derive for rate limiting purposes. The circuit enforces that derivation index `i` satisfies `0 <= i < identity_limit`.
+
 ### 4) Redemption request envelope (Phase 2 request body)
 
 Client wraps the proof in an `x402_zk_credential` body envelope:
@@ -237,7 +239,9 @@ A valid proof MUST prove (suite-defined construction) that:
 - the client holds an issuer-signed credential for `service_id`
 - the credential was signed by the `issuer_pubkey` provided in the presentation
 - `current_time <= expires_at`
-- credential `tier` satisfies server policy
+- credential `tier` ≥ the server's required tier for the requested resource
+- the client's chosen derivation index `i` satisfies `0 <= i < identity_limit`
+- `origin_token` is deterministically derived from private credential material, `origin_id`, and derivation index `i`
 - `origin_id` is correctly bound (prevents replay across origins)
 - the proof outputs include `(origin_token, tier)`
 
@@ -260,7 +264,7 @@ abs(current_time - server_clock) > 60 seconds
 
 ## Replay prevention / rate limiting
 
-`origin_token` is a pseudonymous, origin-bound identifier derived within the proof from private credential material and the origin binding. The same credential MAY produce multiple unlinkable `origin_token` values for the same origin, bounded by the credential's `identity_limit`. Reusing the same derivation inputs across requests produces a stable token (enabling rate limiting) at the cost of cross-request linkability within that origin.
+`origin_token` is a pseudonymous, origin-bound identifier derived within the proof from private credential material, the origin binding, and a derivation index. Using the same derivation index across requests produces a stable `origin_token` (enabling rate limiting) at the cost of cross-request linkability within that origin; different indices produce unlinkable tokens, up to the credential's `identity_limit`.
 
 Verifiers MAY use `origin_token` for bounded replay detection and/or rate limiting within the credential validity window. Caches MUST be TTL-bounded by credential expiry.
 
@@ -269,7 +273,7 @@ Verifiers MAY use `origin_token` for bounded replay detection and/or rate limiti
 | Code | HTTP | Meaning |
 |------|------|---------|
 | `credential_missing` | 402 | no payment or credential provided |
-| `tier_insufficient` | 402 | proof tier below requirement |
+| `tier_insufficient` | 402 | credential tier does not meet the server's required tier; may indicate a server–issuer tier configuration mismatch |
 | `unsupported_version` | 400 | version not supported |
 | `unsupported_suite` | 400 | suite not supported |
 | `invalid_proof` | 400 | proof verification failed (includes origin mismatch) |
@@ -282,4 +286,10 @@ Verifiers MAY use `origin_token` for bounded replay detection and/or rate limiti
 - Presentations **MUST** include `issuer_pubkey`.
 - Verifiers **MUST** only accept presentations whose `issuer_pubkey` is authorized by verifier policy (e.g., local configuration, trusted key list) for the `service_id`.
 - Issuers **MAY** rotate keys at any time; verifiers **SHOULD** overlap old and new keys long enough to avoid breaking valid credentials before expiry.
+
+## Tier Coordination
+
+The `tier` field is an ordinal integer that flows from issuance through proof verification. The server and issuer **MUST** share a common understanding of `tier` values for a given `service_id`, including which payment amounts correspond to which tiers. Verification treats `tier` as ordinal: a credential is accepted when its `tier` ≥ the server's required tier for the requested resource.
+
+The mechanism by which the server and issuer establish this mapping (e.g., static configuration, a registration API, shared deployment) is out of scope for this specification. Implementations **SHOULD** document their tier coordination approach.
 
